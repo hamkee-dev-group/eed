@@ -3,11 +3,17 @@ eed — Secure Minimal Text Editor with Encryption (OpenSSL 3.x)
 eed is a simple, minimal, secure text editor inspired by ed, written in C.
 
 ✅ Supports encrypted text files
+
 ✅ Uses AES-256-CBC for encryption
+
 ✅ Uses HMAC-SHA-256 for integrity protection (MAC)
+
 ✅ Compatible with OpenSSL 3.x → no deprecated functions
+
 ✅ Does not leak plaintext to disk
+
 ✅ Holds buffer in RAM only
+
 ✅ Works on Linux, macOS
 
 Features
