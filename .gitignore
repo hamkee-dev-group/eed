@@ -1,6 +1,0 @@
-*.o
-eed
-Makefile
-.DS_Store
-files/
-.gitignore
