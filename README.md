@@ -24,6 +24,7 @@ AES-256-CBC encryption
 HMAC-SHA-256 message authentication (MAC) → detects tampering
 No temp files, only in-memory buffer until explicitly written
 Compatible with OpenSSL 3.x API → uses EVP_MAC, no deprecated HMAC_CTX
+
 Simple ed-like commands:
 
 | Command      | Description                   |
