@@ -36,12 +36,32 @@ void secure_get_password(char *buf, size_t buflen)
 
     printf("Password: ");
     fflush(stdout);
-    tcgetattr(STDIN_FILENO, &old);
+    if (tcgetattr(STDIN_FILENO, &old) == -1)
+    {
+        perror("tcgetattr");
+        exit(1);
+    }
+
     new = old;
     new.c_lflag &= ~(ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &new);
-    fgets(buf, buflen, stdin);
-    tcsetattr(STDIN_FILENO, TCSANOW, &old);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &new) == -1)
+    {
+        perror("tcsetattr");
+        exit(1);
+    }
+
+    if (!fgets(buf, buflen, stdin))
+    {
+        fprintf(stderr, "Error reading password.\n");
+        exit(1);
+    }
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &old) == -1)
+    {
+        perror("tcsetattr");
+        exit(1);
+    }
+
     printf("\n");
     buf[strcspn(buf, "\n")] = '\0';
 }
@@ -83,7 +103,8 @@ int load_encrypted(const char *filename)
     int chunk_size;
     size_t fsize;
     FILE *f;
-
+    bzero(calc_hmac, HMAC_LEN);
+    bzero(file_hmac, HMAC_LEN);
     f = fopen(filename, "rb");
     if (!f)
     {
@@ -100,8 +121,18 @@ int load_encrypted(const char *filename)
     fsize = ftell(f);
     rewind(f);
 
-    fread(salt, 1, SALT_LEN, f);
-    fread(iv, 1, IV_LEN, f);
+    if (fread(salt, 1, SALT_LEN, f) != SALT_LEN)
+    {
+        perror("fread SALT");
+        fclose(f);
+        return 0;
+    }
+    if (fread(iv, 1, IV_LEN, f) != IV_LEN)
+    {
+        perror("fread IV");
+        fclose(f);
+        return 0;
+    }
 
     PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_LEN,
                       PBKDF2_ITERATIONS, EVP_sha256(), KEY_LEN, key);
@@ -116,24 +147,59 @@ int load_encrypted(const char *filename)
         fclose(f);
         return 0;
     }
-    fread(ciphertext, 1, ciphertext_len, f);
+    if (fread(ciphertext, 1, ciphertext_len, f) != ciphertext_len)
+    {
+        perror("fread ciphertext");
+        free(ciphertext);
+        fclose(f);
+        return 0;
+    }
 
-    fread(file_hmac, 1, HMAC_LEN, f);
+    if (fread(file_hmac, 1, HMAC_LEN, f) != HMAC_LEN)
+    {
+        perror("fread HMAC");
+        free(ciphertext);
+        fclose(f);
+        return 0;
+    }
     fclose(f);
 
     mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    if (!mac)
+    {
+        fprintf(stderr, "ERROR: EVP_MAC_fetch failed.\n");
+        free(ciphertext);
+        return 0;
+    }
     ctx = EVP_MAC_CTX_new(mac);
+    if (!ctx)
+    {
+        fprintf(stderr, "ERROR: EVP_MAC_CTX_new failed.\n");
+        EVP_MAC_free(mac);
+        free(ciphertext);
+        return 0;
+    }
+    if (!EVP_MAC_init(ctx, mac_key, MAC_KEY_LEN, params))
+    {
+        fprintf(stderr, "ERROR: EVP_MAC_init failed.\n");
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        free(ciphertext);
+        return 0;
+    }
 
-    EVP_MAC_init(ctx, mac_key, MAC_KEY_LEN, params);
-
-    EVP_MAC_update(ctx, iv, IV_LEN);
-    EVP_MAC_update(ctx, ciphertext, ciphertext_len);
-
-    EVP_MAC_final(ctx, calc_hmac, &hmac_len, HMAC_LEN);
-
+    if (!EVP_MAC_update(ctx, iv, IV_LEN) ||
+        !EVP_MAC_update(ctx, ciphertext, ciphertext_len) ||
+        !EVP_MAC_final(ctx, calc_hmac, &hmac_len, HMAC_LEN))
+    {
+        fprintf(stderr, "ERROR: EVP_MAC operation failed.\n");
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        free(ciphertext);
+        return 0;
+    }
     EVP_MAC_CTX_free(ctx);
     EVP_MAC_free(mac);
-
     if (memcmp(calc_hmac, file_hmac, HMAC_LEN) != 0)
     {
         fprintf(stderr, "ERROR: File integrity check failed (MAC mismatch).\n");
@@ -144,19 +210,52 @@ int load_encrypted(const char *filename)
     }
 
     cipher_ctx = EVP_CIPHER_CTX_new();
-    EVP_DecryptInit_ex(cipher_ctx, EVP_aes_256_cbc(), NULL, key, iv);
-
+    if (!cipher_ctx)
+    {
+        fprintf(stderr, "ERROR: EVP_CIPHER_CTX_new failed.\n");
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
+        free(ciphertext);
+        return 0;
+    }
+    if (!EVP_DecryptInit_ex(cipher_ctx, EVP_aes_256_cbc(), NULL, key, iv))
+    {
+        fprintf(stderr, "ERROR: EVP_DecryptInit_ex failed.\n");
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
+        free(ciphertext);
+        return 0;
+    }
     while (chunk_offset < (int)ciphertext_len)
     {
         chunk_size = (ciphertext_len - chunk_offset > 1024) ? 1024 : (ciphertext_len - chunk_offset);
         if (!EVP_DecryptUpdate(cipher_ctx, outbuf, &outlen, ciphertext + chunk_offset, chunk_size))
-            break;
+        {
+            fprintf(stderr, "ERROR: EVP_DecryptUpdate failed.\n");
+            EVP_CIPHER_CTX_free(cipher_ctx);
+            OPENSSL_cleanse(key, KEY_LEN);
+            OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
+            free(ciphertext);
+            return 0;
+        }
         chunk_offset += chunk_size;
 
         for (int i = 0; i < outlen; i++)
         {
             if (linelen == 0)
+            {
                 line = malloc(MAX_LINE_LEN);
+                if (!line)
+                {
+                    fprintf(stderr, "ERROR: malloc failed.\n");
+                    EVP_CIPHER_CTX_free(cipher_ctx);
+                    OPENSSL_cleanse(key, KEY_LEN);
+                    OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
+                    free(ciphertext);
+                    return 0;
+                }
+            }
             if (outbuf[i] == '\n')
             {
                 line[linelen] = '\0';
@@ -176,7 +275,18 @@ int load_encrypted(const char *filename)
         for (int i = 0; i < outlen; i++)
         {
             if (linelen == 0)
+            {
                 line = malloc(MAX_LINE_LEN);
+                if (!line)
+                {
+                    fprintf(stderr, "ERROR: malloc failed.\n");
+                    EVP_CIPHER_CTX_free(cipher_ctx);
+                    OPENSSL_cleanse(key, KEY_LEN);
+                    OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
+                    free(ciphertext);
+                    return 0;
+                }
+            }
             if (outbuf[i] == '\n')
             {
                 line[linelen] = '\0';
@@ -203,7 +313,14 @@ void write_encrypted(const char *filename)
     EVP_CIPHER_CTX *cipher_ctx;
     EVP_MAC *mac;
     EVP_MAC_CTX *ctx;
+    unsigned char final_hmac[HMAC_LEN];
+    size_t hmac_len = 0;
+    size_t len = 0;
     unsigned char inbuf[MAX_LINE_LEN], outbuf[MAX_LINE_LEN + EVP_MAX_BLOCK_LENGTH];
+
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_utf8_string("digest", "SHA256", 0),
+        OSSL_PARAM_END};
     int outlen;
 
     FILE *f = fopen(filename, "wb");
@@ -213,52 +330,160 @@ void write_encrypted(const char *filename)
         return;
     }
 
-    RAND_bytes(salt, SALT_LEN);
-    RAND_bytes(iv, IV_LEN);
+    if (RAND_bytes(salt, SALT_LEN) != 1 || RAND_bytes(iv, IV_LEN) != 1)
+    {
+        fprintf(stderr, "ERROR: RAND_bytes failed.\n");
+        fclose(f);
+        return;
+    }
 
     PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_LEN,
                       PBKDF2_ITERATIONS, EVP_sha256(), KEY_LEN, key);
     PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_LEN,
                       PBKDF2_ITERATIONS, EVP_sha256(), MAC_KEY_LEN, mac_key);
 
-    fwrite(salt, 1, SALT_LEN, f);
-    fwrite(iv, 1, IV_LEN, f);
+    if (fwrite(salt, 1, SALT_LEN, f) != SALT_LEN)
+    {
+        perror("fwrite SALT");
+        fclose(f);
+        return;
+    }
+    if (fwrite(iv, 1, IV_LEN, f) != IV_LEN)
+    {
+        perror("fwrite IV");
+        fclose(f);
+        return;
+    }
 
     cipher_ctx = EVP_CIPHER_CTX_new();
-    EVP_EncryptInit_ex(cipher_ctx, EVP_aes_256_cbc(), NULL, key, iv);
+    if (!cipher_ctx)
+    {
+        fprintf(stderr, "ERROR: EVP_CIPHER_CTX_new failed.\n");
+        fclose(f);
+        return;
+    }
+    if (!EVP_EncryptInit_ex(cipher_ctx, EVP_aes_256_cbc(), NULL, key, iv))
+    {
+        fprintf(stderr, "ERROR: EVP_EncryptInit_ex failed.\n");
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
+    }
 
     mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    if (!mac)
+    {
+        fprintf(stderr, "ERROR: EVP_MAC_fetch failed.\n");
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
+    }
     ctx = EVP_MAC_CTX_new(mac);
-    unsigned char final_hmac[HMAC_LEN];
-    size_t hmac_len = 0;
-    size_t len = 0;
-    OSSL_PARAM params[] = {
-        OSSL_PARAM_utf8_string("digest", "SHA256", 0),
-        OSSL_PARAM_END};
-    EVP_MAC_init(ctx, mac_key, MAC_KEY_LEN, params);
+    if (!ctx)
+    {
+        fprintf(stderr, "ERROR: EVP_MAC_CTX_new failed.\n");
+        EVP_MAC_free(mac);
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
+    }
 
-    EVP_MAC_update(ctx, iv, IV_LEN);
-
+    if (!EVP_MAC_init(ctx, mac_key, MAC_KEY_LEN, params))
+    {
+        fprintf(stderr, "ERROR: EVP_MAC_init failed.\n");
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
+    }
+    if (!EVP_MAC_update(ctx, iv, IV_LEN))
+    {
+        fprintf(stderr, "ERROR: EVP_MAC_update failed.\n");
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
+    }
     for (size_t i = 0; i < line_count; i++)
     {
         len = strlen(lines[i]);
         memcpy(inbuf, lines[i], len);
         inbuf[len++] = '\n';
         if (!EVP_EncryptUpdate(cipher_ctx, outbuf, &outlen, inbuf, len))
-            break;
-        fwrite(outbuf, 1, outlen, f);
-        EVP_MAC_update(ctx, outbuf, outlen);
+        {
+            fprintf(stderr, "ERROR: EVP_EncryptUpdate failed.\n");
+            EVP_MAC_CTX_free(ctx);
+            EVP_MAC_free(mac);
+            EVP_CIPHER_CTX_free(cipher_ctx);
+            fclose(f);
+            return;
+        }
+        if (fwrite(outbuf, 1, outlen, f) != (size_t)outlen)
+        {
+            fprintf(stderr, "ERROR: fwrite failed.\n");
+            EVP_MAC_CTX_free(ctx);
+            EVP_MAC_free(mac);
+            EVP_CIPHER_CTX_free(cipher_ctx);
+            fclose(f);
+            return;
+        }
+        if (!EVP_MAC_update(ctx, outbuf, outlen))
+        {
+            fprintf(stderr, "ERROR: EVP_MAC_update failed.\n");
+            EVP_MAC_CTX_free(ctx);
+            EVP_MAC_free(mac);
+            EVP_CIPHER_CTX_free(cipher_ctx);
+            fclose(f);
+            return;
+        }
     }
-
-    if (EVP_EncryptFinal_ex(cipher_ctx, outbuf, &outlen))
+    if (!EVP_EncryptFinal_ex(cipher_ctx, outbuf, &outlen))
     {
-        fwrite(outbuf, 1, outlen, f);
-        EVP_MAC_update(ctx, outbuf, outlen);
+        fprintf(stderr, "ERROR: EVP_EncryptFinal_ex failed.\n");
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
     }
-
-    EVP_MAC_final(ctx, final_hmac, &hmac_len, HMAC_LEN);
-    fwrite(final_hmac, 1, HMAC_LEN, f);
-
+    if (fwrite(outbuf, 1, outlen, f) != (size_t)outlen)
+    {
+        fprintf(stderr, "ERROR: fwrite final failed.\n");
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
+    }
+    if (!EVP_MAC_update(ctx, outbuf, outlen))
+    {
+        fprintf(stderr, "ERROR: EVP_MAC_update final failed.\n");
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
+    }
+    if (!EVP_MAC_final(ctx, final_hmac, &hmac_len, HMAC_LEN))
+    {
+        fprintf(stderr, "ERROR: EVP_MAC_final failed.\n");
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
+    }
+    if (fwrite(final_hmac, 1, HMAC_LEN, f) != HMAC_LEN)
+    {
+        fprintf(stderr, "ERROR: fwrite HMAC failed.\n");
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        fclose(f);
+        return;
+    }
     EVP_CIPHER_CTX_free(cipher_ctx);
     EVP_MAC_CTX_free(ctx);
     EVP_MAC_free(mac);
@@ -446,14 +671,16 @@ int main(int argc, char *argv[])
     {
         if (errno == ENOENT)
         {
-            printf("Confirm password: ");
+            printf("Confirm ");
             secure_get_password(confirm_password, sizeof(confirm_password));
             if (strcmp(password, confirm_password) != 0)
             {
                 fprintf(stderr, "Passwords do not match.\n");
                 secure_cleanup();
+                OPENSSL_cleanse(confirm_password, sizeof(confirm_password));
                 return 1;
             }
+            OPENSSL_cleanse(confirm_password, sizeof(confirm_password));
         }
         else
         {
@@ -532,5 +759,6 @@ int main(int argc, char *argv[])
     }
 
     secure_cleanup();
+
     return 0;
 }
