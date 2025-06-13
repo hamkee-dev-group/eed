@@ -4,6 +4,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <regex.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -82,12 +83,6 @@ int load_encrypted(const char *filename)
     int chunk_size;
     size_t fsize;
     FILE *f;
-    struct stat st;
-
-    if (stat(filename, &st) == -1)
-    {
-        return 1;
-    }
 
     f = fopen(filename, "rb");
     if (!f)
@@ -96,7 +91,7 @@ int load_encrypted(const char *filename)
         return 0;
     }
 
-    if(fseek(f, 0, SEEK_END) == -1)
+    if (fseek(f, 0, SEEK_END) == -1)
     {
         perror("fseek");
         fclose(f);
@@ -115,7 +110,7 @@ int load_encrypted(const char *filename)
 
     ciphertext_len = fsize - SALT_LEN - IV_LEN - HMAC_LEN;
     ciphertext = malloc(ciphertext_len);
-    if(ciphertext == NULL)
+    if (ciphertext == NULL)
     {
         perror("malloc");
         fclose(f);
@@ -431,6 +426,10 @@ int main(int argc, char *argv[])
 {
     char cmd[256];
     char *pattern;
+    char confirm_password[128];
+    struct stat st;
+
+    memset(password, 0, sizeof(password));
     if (argc != 2)
     {
         fprintf(stderr, "Usage: %s <file>\n", argv[0]);
@@ -441,14 +440,36 @@ int main(int argc, char *argv[])
         fprintf(stderr, "ERROR: Could not load OpenSSL default provider.\n");
         return 1;
     }
-
     secure_get_password(password, sizeof(password));
-    if (!load_encrypted(argv[1]))
-    {
-        secure_cleanup();
-        return 1;
-    }
 
+    if (stat(argv[1], &st) == -1)
+    {
+        if (errno == ENOENT)
+        {
+            printf("Confirm password: ");
+            secure_get_password(confirm_password, sizeof(confirm_password));
+            if (strcmp(password, confirm_password) != 0)
+            {
+                fprintf(stderr, "Passwords do not match.\n");
+                secure_cleanup();
+                return 1;
+            }
+        }
+        else
+        {
+            perror("stat");
+            secure_cleanup();
+            return 1;
+        }
+    }
+    else
+    {
+        if (!load_encrypted(argv[1]))
+        {
+            secure_cleanup();
+            return 1;
+        }
+    }
     while (1)
     {
         printf("> ");
