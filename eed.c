@@ -102,6 +102,7 @@ int load_encrypted(const char *filename)
     int chunk_offset = 0;
     int chunk_size;
     size_t fsize;
+    long ftellsize;
     FILE *f;
     bzero(calc_hmac, HMAC_LEN);
     bzero(file_hmac, HMAC_LEN);
@@ -118,9 +119,20 @@ int load_encrypted(const char *filename)
         fclose(f);
         return 0;
     }
-    fsize = ftell(f);
-    rewind(f);
-
+    ftellsize = ftell(f);
+    if (ftellsize == -1)
+    {
+        perror("ftell");
+        fclose(f);
+        return 0;
+    }
+    fsize = (size_t)ftellsize;
+    if (fseek(f, 0L, SEEK_SET) == -1)
+    {
+        perror("fseek");
+        fclose(f);
+        return 0;
+    }
     if (fread(salt, 1, SALT_LEN, f) != SALT_LEN)
     {
         perror("fread SALT");
@@ -200,7 +212,7 @@ int load_encrypted(const char *filename)
     }
     EVP_MAC_CTX_free(ctx);
     EVP_MAC_free(mac);
-    if (memcmp(calc_hmac, file_hmac, HMAC_LEN) != 0)
+    if (CRYPTO_memcmp(calc_hmac, file_hmac, HMAC_LEN) != 0)
     {
         fprintf(stderr, "ERROR: File integrity check failed (MAC mismatch).\n");
         OPENSSL_cleanse(key, KEY_LEN);
