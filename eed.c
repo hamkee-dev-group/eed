@@ -875,7 +875,8 @@ int main(int argc, char *argv[])
             break;
         case 'q':
             secure_cleanup();
-            break;
+            fclose(file);
+            return 0;
         case '/':
             pattern = strtok(cmd + 1, "/\n");
             if (pattern)
