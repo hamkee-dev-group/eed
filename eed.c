@@ -6,6 +6,11 @@
 #include <regex.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <signal.h>
+
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
@@ -29,7 +34,6 @@ int load_default_provider(void)
     OSSL_PROVIDER *provider = OSSL_PROVIDER_load(NULL, "default");
     return (!provider) ? 0 : 1;
 }
-
 void secure_get_password(char *buf, size_t buflen)
 {
     struct termios old, new;
@@ -78,7 +82,8 @@ void free_lines(void)
     }
     line_count = 0;
 }
-int load_encrypted(const char *filename)
+
+int load_encrypted(FILE *f)
 {
     unsigned char salt[SALT_LEN], iv[IV_LEN], key[KEY_LEN], mac_key[MAC_KEY_LEN];
     unsigned char *ciphertext;
@@ -103,67 +108,63 @@ int load_encrypted(const char *filename)
     int chunk_size;
     size_t fsize;
     long ftellsize;
-    FILE *f;
     bzero(calc_hmac, HMAC_LEN);
     bzero(file_hmac, HMAC_LEN);
-    f = fopen(filename, "rb");
-    if (!f)
-    {
-        perror("fopen");
-        return 0;
-    }
 
     if (fseek(f, 0, SEEK_END) == -1)
     {
         perror("fseek");
-        fclose(f);
         return 0;
     }
     ftellsize = ftell(f);
     if (ftellsize == -1)
     {
         perror("ftell");
-        fclose(f);
         return 0;
     }
     fsize = (size_t)ftellsize;
     if (fseek(f, 0L, SEEK_SET) == -1)
     {
         perror("fseek");
-        fclose(f);
         return 0;
     }
     if (fread(salt, 1, SALT_LEN, f) != SALT_LEN)
     {
         perror("fread SALT");
-        fclose(f);
         return 0;
     }
     if (fread(iv, 1, IV_LEN, f) != IV_LEN)
     {
         perror("fread IV");
-        fclose(f);
         return 0;
     }
 
-    PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_LEN,
-                      PBKDF2_ITERATIONS, EVP_sha256(), KEY_LEN, key);
-    PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_LEN,
-                      PBKDF2_ITERATIONS, EVP_sha256(), MAC_KEY_LEN, mac_key);
+    if (!PKCS5_PBKDF2_HMAC(password, strnlen(password, sizeof(password)), salt, SALT_LEN,
+                           PBKDF2_ITERATIONS, EVP_sha256(), KEY_LEN, key))
+    {
+        fprintf(stderr, "ERROR: Key derivation for encryption key failed.\n");
+        return 0;
+    }
+    if (!PKCS5_PBKDF2_HMAC(password, strnlen(password, sizeof(password)), salt, SALT_LEN,
+                           PBKDF2_ITERATIONS, EVP_sha256(), MAC_KEY_LEN, mac_key))
+    {
+        fprintf(stderr, "ERROR: Key derivation for MAC key failed.\n");
+        OPENSSL_cleanse(key, KEY_LEN);
+
+        return 0;
+    }
 
     ciphertext_len = fsize - SALT_LEN - IV_LEN - HMAC_LEN;
     ciphertext = malloc(ciphertext_len);
     if (ciphertext == NULL)
     {
         perror("malloc");
-        fclose(f);
         return 0;
     }
     if (fread(ciphertext, 1, ciphertext_len, f) != ciphertext_len)
     {
         perror("fread ciphertext");
         free(ciphertext);
-        fclose(f);
         return 0;
     }
 
@@ -171,10 +172,8 @@ int load_encrypted(const char *filename)
     {
         perror("fread HMAC");
         free(ciphertext);
-        fclose(f);
         return 0;
     }
-    fclose(f);
 
     mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
     if (!mac)
@@ -245,6 +244,12 @@ int load_encrypted(const char *filename)
         if (!EVP_DecryptUpdate(cipher_ctx, outbuf, &outlen, ciphertext + chunk_offset, chunk_size))
         {
             fprintf(stderr, "ERROR: EVP_DecryptUpdate failed.\n");
+            if (line)
+            {
+                OPENSSL_cleanse(line, linelen);
+                free(line);
+                line = NULL;
+            }
             EVP_CIPHER_CTX_free(cipher_ctx);
             OPENSSL_cleanse(key, KEY_LEN);
             OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
@@ -261,6 +266,12 @@ int load_encrypted(const char *filename)
                 if (!line)
                 {
                     fprintf(stderr, "ERROR: malloc failed.\n");
+                    if (linelen)
+                    {
+                        OPENSSL_cleanse(line, linelen);
+                        free(line);
+                        line = NULL;
+                    }
                     EVP_CIPHER_CTX_free(cipher_ctx);
                     OPENSSL_cleanse(key, KEY_LEN);
                     OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
@@ -292,6 +303,12 @@ int load_encrypted(const char *filename)
                 if (!line)
                 {
                     fprintf(stderr, "ERROR: malloc failed.\n");
+                    if (linelen)
+                    {
+                        OPENSSL_cleanse(line, linelen);
+                        free(line);
+                        line = NULL;
+                    }
                     EVP_CIPHER_CTX_free(cipher_ctx);
                     OPENSSL_cleanse(key, KEY_LEN);
                     OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
@@ -312,14 +329,19 @@ int load_encrypted(const char *filename)
             }
         }
     }
-
     EVP_CIPHER_CTX_free(cipher_ctx);
+    if (line && linelen > 0)
+    {
+        OPENSSL_cleanse(line, linelen);
+        free(line);
+    }
     OPENSSL_cleanse(key, KEY_LEN);
     OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
     free(ciphertext);
     return 1;
 }
-void write_encrypted(const char *filename)
+
+void write_encrypted(FILE *f)
 {
     unsigned char salt[SALT_LEN], iv[IV_LEN], key[KEY_LEN], mac_key[MAC_KEY_LEN];
     EVP_CIPHER_CTX *cipher_ctx;
@@ -335,35 +357,38 @@ void write_encrypted(const char *filename)
         OSSL_PARAM_END};
     int outlen;
 
-    FILE *f = fopen(filename, "wb");
-    if (!f)
-    {
-        perror("fopen");
-        return;
-    }
-
     if (RAND_bytes(salt, SALT_LEN) != 1 || RAND_bytes(iv, IV_LEN) != 1)
     {
         fprintf(stderr, "ERROR: RAND_bytes failed.\n");
-        fclose(f);
         return;
     }
 
-    PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_LEN,
-                      PBKDF2_ITERATIONS, EVP_sha256(), KEY_LEN, key);
-    PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_LEN,
-                      PBKDF2_ITERATIONS, EVP_sha256(), MAC_KEY_LEN, mac_key);
+    if (!PKCS5_PBKDF2_HMAC(password, strnlen(password, sizeof(password)), salt, SALT_LEN,
+                           PBKDF2_ITERATIONS, EVP_sha256(), KEY_LEN, key))
+    {
+        fprintf(stderr, "ERROR: Key derivation for encryption key failed.\n");
+        return;
+    }
+    if (!PKCS5_PBKDF2_HMAC(password, strnlen(password, sizeof(password)), salt, SALT_LEN,
+                           PBKDF2_ITERATIONS, EVP_sha256(), MAC_KEY_LEN, mac_key))
+    {
+        fprintf(stderr, "ERROR: Key derivation for MAC key failed.\n");
+        OPENSSL_cleanse(key, KEY_LEN);
+        return;
+    }
 
     if (fwrite(salt, 1, SALT_LEN, f) != SALT_LEN)
     {
         perror("fwrite SALT");
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     if (fwrite(iv, 1, IV_LEN, f) != IV_LEN)
     {
         perror("fwrite IV");
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
 
@@ -371,14 +396,17 @@ void write_encrypted(const char *filename)
     if (!cipher_ctx)
     {
         fprintf(stderr, "ERROR: EVP_CIPHER_CTX_new failed.\n");
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     if (!EVP_EncryptInit_ex(cipher_ctx, EVP_aes_256_cbc(), NULL, key, iv))
     {
         fprintf(stderr, "ERROR: EVP_EncryptInit_ex failed.\n");
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
+
         return;
     }
 
@@ -387,7 +415,8 @@ void write_encrypted(const char *filename)
     {
         fprintf(stderr, "ERROR: EVP_MAC_fetch failed.\n");
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     ctx = EVP_MAC_CTX_new(mac);
@@ -396,7 +425,8 @@ void write_encrypted(const char *filename)
         fprintf(stderr, "ERROR: EVP_MAC_CTX_new failed.\n");
         EVP_MAC_free(mac);
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
 
@@ -406,7 +436,8 @@ void write_encrypted(const char *filename)
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     if (!EVP_MAC_update(ctx, iv, IV_LEN))
@@ -415,7 +446,8 @@ void write_encrypted(const char *filename)
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     for (size_t i = 0; i < line_count; i++)
@@ -429,7 +461,8 @@ void write_encrypted(const char *filename)
             EVP_MAC_CTX_free(ctx);
             EVP_MAC_free(mac);
             EVP_CIPHER_CTX_free(cipher_ctx);
-            fclose(f);
+            OPENSSL_cleanse(key, KEY_LEN);
+            OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
             return;
         }
         if (fwrite(outbuf, 1, outlen, f) != (size_t)outlen)
@@ -438,7 +471,8 @@ void write_encrypted(const char *filename)
             EVP_MAC_CTX_free(ctx);
             EVP_MAC_free(mac);
             EVP_CIPHER_CTX_free(cipher_ctx);
-            fclose(f);
+            OPENSSL_cleanse(key, KEY_LEN);
+            OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
             return;
         }
         if (!EVP_MAC_update(ctx, outbuf, outlen))
@@ -447,7 +481,8 @@ void write_encrypted(const char *filename)
             EVP_MAC_CTX_free(ctx);
             EVP_MAC_free(mac);
             EVP_CIPHER_CTX_free(cipher_ctx);
-            fclose(f);
+            OPENSSL_cleanse(key, KEY_LEN);
+            OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
             return;
         }
     }
@@ -457,7 +492,8 @@ void write_encrypted(const char *filename)
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     if (fwrite(outbuf, 1, outlen, f) != (size_t)outlen)
@@ -466,7 +502,8 @@ void write_encrypted(const char *filename)
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     if (!EVP_MAC_update(ctx, outbuf, outlen))
@@ -475,7 +512,8 @@ void write_encrypted(const char *filename)
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     if (!EVP_MAC_final(ctx, final_hmac, &hmac_len, HMAC_LEN))
@@ -484,7 +522,8 @@ void write_encrypted(const char *filename)
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     if (fwrite(final_hmac, 1, HMAC_LEN, f) != HMAC_LEN)
@@ -493,7 +532,8 @@ void write_encrypted(const char *filename)
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
         EVP_CIPHER_CTX_free(cipher_ctx);
-        fclose(f);
+        OPENSSL_cleanse(key, KEY_LEN);
+        OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
         return;
     }
     EVP_CIPHER_CTX_free(cipher_ctx);
@@ -501,7 +541,6 @@ void write_encrypted(const char *filename)
     EVP_MAC_free(mac);
     OPENSSL_cleanse(key, KEY_LEN);
     OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
-    fclose(f);
 }
 void print_buffer(void)
 {
@@ -523,7 +562,13 @@ void append_lines(void)
         buf[strcspn(buf, "\n")] = '\0';
         if (line_count < MAX_LINES)
         {
-            lines[line_count] = strdup(buf);
+            char *copy = strdup(buf);
+            if (!copy)
+            {
+                perror("strdup");
+                return;
+            }
+            lines[line_count] = copy;
             line_count++;
         }
     }
@@ -535,11 +580,17 @@ void insert_lines(void)
     char buf[MAX_LINE_LEN];
     size_t insert_pos = 0;
     printf("Insert before line number: ");
-    scanf("%zu", &n);
+    if (scanf("%zu", &n) != 1)
+    {
+        fprintf(stderr, "Invalid input.\n");
+        while (getchar() != '\n')
+            ;
+        return;
+    }
     getchar();
     if (n < 1 || n > line_count + 1)
     {
-        printf("Invalid line number\n");
+        fprintf(stderr, "Invalid line number\n");
         return;
     }
     printf("Enter lines, single '.' on line to finish:\n");
@@ -555,7 +606,13 @@ void insert_lines(void)
             {
                 lines[i] = lines[i - 1];
             }
-            lines[insert_pos++] = strdup(buf);
+            char *copy = strdup(buf);
+            if (!copy)
+            {
+                perror("strdup");
+                return;
+            }
+            lines[insert_pos++] = copy;
             line_count++;
         }
     }
@@ -567,6 +624,13 @@ void change_line(void)
     size_t n;
     printf("Change line number: ");
     scanf("%zu", &n);
+    if (scanf("%zu", &n) != 1)
+    {
+        printf("Invalid input.\n");
+        while (getchar() != '\n')
+            ; // flush input
+        return;
+    }
     getchar();
     if (n == 0 || n > line_count)
     {
@@ -578,7 +642,14 @@ void change_line(void)
     buf[strcspn(buf, "\n")] = '\0';
     OPENSSL_cleanse(lines[n - 1], strlen(lines[n - 1]));
     free(lines[n - 1]);
-    lines[n - 1] = strdup(buf);
+    char *copy = strdup(buf);
+    if (!copy)
+    {
+        perror("strdup");
+        return;
+    }
+
+    lines[n - 1] = copy;
 }
 
 void delete_line(void)
@@ -586,6 +657,13 @@ void delete_line(void)
     size_t n;
     printf("Delete line number: ");
     scanf("%zu", &n);
+    if (scanf("%zu", &n) != 1)
+    {
+        printf("Invalid input.\n");
+        while (getchar() != '\n')
+            ; // flush input
+        return;
+    }
     getchar();
     if (n == 0 || n > line_count)
     {
@@ -632,7 +710,13 @@ void substitute(const char *old, const char *new)
             prefix_len = pos - lines[i];
             snprintf(buf, sizeof(buf), "%.*s%s%s", (int)prefix_len, lines[i], new, pos + strlen(old));
             free(lines[i]);
-            lines[i] = strdup(buf);
+            char *copy = strdup(buf);
+            if (!copy)
+            {
+                perror("strdup");
+                return;
+            }
+            lines[i] = copy;
         }
     }
 }
@@ -659,56 +743,100 @@ void secure_cleanup(void)
     free_lines();
 }
 
+void handle_exit(int sig)
+{
+    (void)sig;
+    secure_cleanup();
+    _exit(1);
+}
 int main(int argc, char *argv[])
 {
     char cmd[256];
     char *pattern;
     char confirm_password[128];
     struct stat st;
-
+    FILE *file = NULL;
+    int fd;
+    struct rlimit rl = {0};
+    signal(SIGINT, handle_exit);
+    signal(SIGTERM, handle_exit);
+    signal(SIGSEGV, handle_exit);
     memset(password, 0, sizeof(password));
     if (argc != 2)
     {
         fprintf(stderr, "Usage: %s <file>\n", argv[0]);
         return 1;
     }
+    umask(0077);
+    unsetenv("HISTFILE");
+    unsetenv("HISTSIZE");
+    unsetenv("HISTFILESIZE");
+    setrlimit(RLIMIT_CORE, &rl);
     if (!load_default_provider())
     {
         fprintf(stderr, "ERROR: Could not load OpenSSL default provider.\n");
         return 1;
     }
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+    {
+        perror("mlockall");
+        return 1;
+    }
+
     secure_get_password(password, sizeof(password));
 
-    if (stat(argv[1], &st) == -1)
+    fd = open(argv[1], O_RDWR | O_CREAT, 0600);
+    if (fd == -1)
     {
-        if (errno == ENOENT)
+        perror("open");
+        return 1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) == -1)
+    {
+        fprintf(stderr, "ERROR: File is already open in another instance.\n");
+        close(fd);
+        return 1;
+    }
+    file = fdopen(fd, "rb+");
+
+    if (!file)
+    {
+        perror("fdopen");
+        close(fd);
+        return 1;
+    }
+    setvbuf(file, NULL, _IONBF, 0);
+
+    if (fstat(fd, &st) == -1)
+    {
+        perror("fstat");
+        fclose(file);
+        return 1;
+    }
+    if (st.st_size == 0)
+    {
+        printf("Confirm ");
+        secure_get_password(confirm_password, sizeof(confirm_password));
+        if (strcmp(password, confirm_password) != 0)
         {
-            printf("Confirm ");
-            secure_get_password(confirm_password, sizeof(confirm_password));
-            if (strcmp(password, confirm_password) != 0)
-            {
-                fprintf(stderr, "Passwords do not match.\n");
-                secure_cleanup();
-                OPENSSL_cleanse(confirm_password, sizeof(confirm_password));
-                return 1;
-            }
-            OPENSSL_cleanse(confirm_password, sizeof(confirm_password));
-        }
-        else
-        {
-            perror("stat");
+            fprintf(stderr, "Passwords do not match.\n");
             secure_cleanup();
+            OPENSSL_cleanse(confirm_password, sizeof(confirm_password));
+            fclose(file);
             return 1;
         }
+        OPENSSL_cleanse(confirm_password, sizeof(confirm_password));
     }
     else
     {
-        if (!load_encrypted(argv[1]))
+        if (!load_encrypted(file))
         {
             secure_cleanup();
+            fclose(file);
             return 1;
         }
     }
+
     while (1)
     {
         printf("> ");
@@ -735,12 +863,18 @@ int main(int argc, char *argv[])
             printf("Lines: %zu\n", line_count);
             break;
         case 'w':
-            write_encrypted(argv[1]);
+            fflush(file);
+            fseek(file, 0, SEEK_SET);
+            if (ftruncate(fileno(file), 0) == -1)
+            {
+                perror("ftruncate");
+                break;
+            }
+            write_encrypted(file);
             printf("File written.\n");
             break;
         case 'q':
             secure_cleanup();
-            return 0;
             break;
         case '/':
             pattern = strtok(cmd + 1, "/\n");
@@ -750,7 +884,6 @@ int main(int argc, char *argv[])
         case 's':
             if (cmd[1] == '/')
             {
-
                 char *old = strtok(cmd + 2, "/");
                 char *new = strtok(NULL, "/\n");
                 if (old && new)
@@ -771,6 +904,6 @@ int main(int argc, char *argv[])
     }
 
     secure_cleanup();
-
+    fclose(file);
     return 0;
 }
