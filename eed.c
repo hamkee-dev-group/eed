@@ -350,12 +350,13 @@ void write_encrypted(FILE *f)
     unsigned char final_hmac[HMAC_LEN];
     size_t hmac_len = 0;
     size_t len = 0;
+    int outlen;
+
     unsigned char inbuf[MAX_LINE_LEN], outbuf[MAX_LINE_LEN + EVP_MAX_BLOCK_LENGTH];
 
     OSSL_PARAM params[] = {
         OSSL_PARAM_utf8_string("digest", "SHA256", 0),
         OSSL_PARAM_END};
-    int outlen;
 
     if (RAND_bytes(salt, SALT_LEN) != 1 || RAND_bytes(iv, IV_LEN) != 1)
     {
@@ -406,7 +407,6 @@ void write_encrypted(FILE *f)
         EVP_CIPHER_CTX_free(cipher_ctx);
         OPENSSL_cleanse(key, KEY_LEN);
         OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
-
         return;
     }
 
@@ -542,6 +542,7 @@ void write_encrypted(FILE *f)
     OPENSSL_cleanse(key, KEY_LEN);
     OPENSSL_cleanse(mac_key, MAC_KEY_LEN);
 }
+
 void print_buffer(void)
 {
     for (size_t i = 0; i < line_count; i++)
@@ -885,8 +886,8 @@ int main(int argc, char *argv[])
         case 's':
             if (cmd[1] == '/')
             {
-                char *old = strtok(cmd + 2, "/");
-                char *new = strtok(NULL, "/\n");
+                const char *old = strtok(cmd + 2, "/");
+                const char *new = strtok(NULL, "/\n");
                 if (old && new)
                     substitute(old, new);
             }
